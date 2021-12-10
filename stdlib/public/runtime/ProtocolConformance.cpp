@@ -29,9 +29,16 @@
 #include "llvm/ADT/DenseMap.h"
 #include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ImageInspection.h"
+#include "ImageInspectionCommon.h"
 #include "Private.h"
+#include "TypeDiscovery.h"
 
 #include <vector>
+
+#if defined(__MACH__)
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#endif
 
 #if __has_include(<mach-o/dyld_priv.h>)
 #include <mach-o/dyld_priv.h>
@@ -1269,6 +1276,189 @@ const Metadata *swift::findConformingSuperclass(
       candidate.getMatchingType(type, true /*instantiateSuperclassMetadata*/);
   assert(conformingType);
   return conformingType;
+}
+
+/// Walk the conformances in a \c ConformanceSection instance, check if they
+/// specify conformance to all the specified protocols, and call \a body for the
+/// types that match.
+SWIFT_CC(swift)
+static void _enumerateConformingTypesFromSection(
+  const ConformanceSection *section,
+  size_t count,
+  const llvm::ArrayRef<ProtocolDescriptorRef>& protocols,
+  TypeEnumerationFunction body,
+  void *bodyContext,
+  bool *stop,
+  SWIFT_CONTEXT void *context,
+  SWIFT_ERROR_RESULT SwiftError **error) {
+
+  for (size_t i = 0; i < count; i++) {
+    for (const auto& record : *section) {
+      auto protocolDescriptor = record->getProtocol();
+      auto metadata = record->getCanonicalTypeMetadata();
+      if (!protocolDescriptor || !metadata) {
+        // This record does not contain the info we're interested in.
+        continue;
+      }
+
+      for (const auto& protocol : protocols) {
+        const auto& swiftProtocol = protocol.getSwiftProtocol();
+        if (!swift_conformsToProtocol(metadata, swiftProtocol)) {
+          // This type does not conform to the specified protocol(s), so skip.
+          continue;
+        }
+      }
+
+      body(metadata, stop, bodyContext, error);
+      if (*stop || *error) {
+        return;
+      }
+    }
+  }
+}
+
+#if defined(__MACH__)
+/// Get the conformance section of a given Mach-O image.
+///
+/// If the image does not have a conformance section, returns \c llvm::None.
+static llvm::Optional<ConformanceSection>
+_getConformanceSectionFromMachImage(const void *imageAddress) {
+  unsigned long sectionSize = 0;
+#ifdef __LP64__
+  typedef const mach_header_64 *MachHeaderAddress;
+#else
+  typedef const mach_header *MachHeaderAddress;
+#endif
+  const auto& sectionData = getsectiondata((MachHeaderAddress)imageAddress,
+                                           SEG_TEXT,
+                                           MachOProtocolConformancesSection,
+                                           &sectionSize);
+  if (sectionData) {
+    return ConformanceSection(sectionData, sectionSize);
+  }
+
+  return llvm::None;
+}
+#endif
+
+SWIFT_CC(swift)
+void swift::swift_enumerateConformingTypesFromImage(
+  const void *imageAddress,
+  const Metadata *protocolMetadata,
+  TypeEnumerationFunction body,
+  void *bodyContext,
+  SWIFT_CONTEXT void *context,
+  SWIFT_ERROR_RESULT SwiftError **error) {
+
+  // Find the protocol(s) requested by the caller.
+  auto existentialType = dyn_cast<ExistentialTypeMetadata>(protocolMetadata);
+  if (!existentialType) {
+    auto typeName = swift_getTypeName(protocolMetadata, true);
+    swift::fatalError(
+      0,
+      "_enumerateTypes(fromImageAt:conformingTo:_:) can only test for "
+      "conformance to a protocol, but %.*s is not a protocol.",
+      (int)typeName.length, typeName.data);
+  }
+  const auto& protocols = existentialType->getProtocols();
+
+  if (protocols.empty()) {
+    swift::fatalError(
+      0,
+      "Any is not a protocol and _enumerateTypes(fromImageAt:conformingTo:_:) "
+      "cannot test for conformance to it.");
+  }
+
+#if SWIFT_OBJC_INTEROP
+  // Check for any Objective-C protocols in the input. We do not currently
+  // support searching for Objective-C protocol conformances because they do not
+  // produce conformance records in the compiled binary. In the future, if we
+  // detect any such protocols, we can use objc_copyClassList() to add to the
+  // enumerated set (taking care not to enumerate a class twice if it conforms
+  // to an Objective-C protocol *and* a Swift protocol.)
+  for (const auto& protocol : protocols) {
+    if (protocol.isObjC()) {
+      swift::fatalError(
+        0,
+        "_enumerateTypes(fromImageAt:conformingTo:_:) does not currently "
+        "support Objective-C protocols such as %s.",
+        protocol.getName());
+    }
+  }
+#endif
+
+#if defined(__WASM__)
+  // Swift+WASM does not support dynamic linking and #dsohandle is 0, so
+  // ignore the passed image address and iterate over any/all available
+  // sections. Presumably only one will be available.
+  imageAddress = nullptr;
+#endif
+
+  // Callback parameters (hoisted out of the loops.)
+  bool stop = false;
+  *error = nullptr;
+
+#if defined(__MACH__)
+  // This platform has dyld and we can use it instead of walking the section
+  // table. Takes care of the nuances of DYLD shared cache support.
+  if (imageAddress) {
+    if (auto section = _getConformanceSectionFromMachImage(imageAddress)) {
+      _enumerateConformingTypesFromSection(section.getPointer(), 1,
+                                           protocols, body, bodyContext,
+                                           &stop, context, error);
+    }
+
+  } else {
+    // Walk all loaded images and consider each one in turn. The calls into dyld
+    // aren't thread-safe (another thread could modify the set of loaded images)
+    // but not in a "I'm going to crash" sense, just a "missed an image" sense.
+    auto count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+      const auto& imageAddress = _dyld_get_image_header(i);
+      if (!imageAddress) {
+        continue;
+      }
+
+      if (auto section = _getConformanceSectionFromMachImage(imageAddress)) {
+        _enumerateConformingTypesFromSection(section.getPointer(), 1,
+                                             protocols, body, bodyContext,
+                                             &stop, context, error);
+        if (stop || *error) {
+          return;
+        }
+      }
+    }
+  }
+
+#else
+  // This platform doesn't have getsectiondata(), so walk all sections in the
+  // conformances table.
+  auto snapshot = Conformances.get().SectionsToScan.snapshot();
+
+  if (imageAddress) {
+    // FIXME: This operation is somewhat costly and could probably be optimized on a per-platform basis.
+    for (const auto& section : snapshot) {
+      // Check if this section came from the image of interest.
+      SymbolInfo info;
+      if (!lookupSymbol(section.begin(), &info)) {
+        continue;
+      }
+
+      if (info.baseAddress == imageAddress) {
+        _enumerateConformingTypesFromSection(&section, 1,
+                                             protocols, body, bodyContext,
+                                             &stop, context, error);
+        return;
+      }
+    }
+
+  } else {
+    // Walk all sections.
+    _enumerateConformingTypesFromSection(snapshot.begin(), snapshot.count(),
+                                         protocols, body, bodyContext,
+                                         &stop, context, error);
+  }
+#endif
 }
 
 #define OVERRIDE_PROTOCOLCONFORMANCE COMPATIBILITY_OVERRIDE
